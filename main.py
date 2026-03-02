@@ -62,3 +62,4 @@ if __name__ == "__main__":
     news = get_news()
     summary = summarize(news)
     print(summary)
+    send_email(summary)
