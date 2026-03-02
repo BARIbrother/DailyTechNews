@@ -1,10 +1,9 @@
 import feedparser
-import openai
+from openai import OpenAI
 import os
 from datetime import datetime, timedelta
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 RSS_URL = "https://news.google.com/rss/search?q=AI+OR+quantum+computing+OR+semiconductor&hl=en-US&gl=US&ceid=US:en"
 
@@ -29,7 +28,7 @@ def summarize(articles):
     for a in articles:
         content += f"{a['title']}\n{a['summary']}\n{a['link']}\n\n"
 
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "You are an MIT-level tech analyst."},
