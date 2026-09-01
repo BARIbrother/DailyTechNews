@@ -1,18 +1,76 @@
+import math
 import os
 import re
 import smtplib
+import time
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import quote
 
 import feedparser
 import requests
 from openai import OpenAI
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-RSS_URL = "https://news.google.com/rss/search?q=AI+OR+quantum+computing+OR+semiconductor&hl=en-US&gl=US&ceid=US:en"
 HTTP_HEADERS = {"User-Agent": "DailyTechNews/1.0 (GitHub Actions)"}
 HTTP_TIMEOUT = 20
+HN_WINDOW_HOURS = 48
+CANDIDATE_LIMIT = 30
+
+TOPIC_PATTERN = re.compile(
+    r"\b("
+    r"ai|a\.i\.|artificial intelligence|machine learning|deep learning|"
+    r"llm|gpt|openai|anthropic|quantum|qubit|"
+    r"semiconductor|chip|chips|gpu|nvidia|tsmc|asml|"
+    r"foundry|wafer|hbm|lithography|neural|transformer"
+    r")\b",
+    re.I,
+)
+
+RSS_SOURCES = [
+    {
+        "name": "IEEE Spectrum",
+        "url": "https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss",
+        "weight": 8.5,
+        "require_topic": False,
+    },
+    {
+        "name": "IEEE Spectrum",
+        "url": "https://spectrum.ieee.org/feeds/topic/semiconductors.rss",
+        "weight": 8.5,
+        "require_topic": False,
+    },
+    {
+        "name": "MIT Technology Review",
+        "url": "https://www.technologyreview.com/feed/",
+        "weight": 8.5,
+        "require_topic": True,
+    },
+    {
+        "name": "Nature",
+        "url": "https://www.nature.com/nature.rss",
+        "weight": 9.0,
+        "require_topic": True,
+    },
+    {
+        "name": "Ars Technica",
+        "url": "https://feeds.arstechnica.com/arstechnica/index",
+        "weight": 7.5,
+        "require_topic": True,
+    },
+]
+
+HN_QUERIES = [
+    "artificial intelligence",
+    "quantum computing",
+    "semiconductor",
+    "NVIDIA GPU",
+    "TSMC",
+]
+
+
+def openai_client():
+    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
 def fetch_json(url):
@@ -21,81 +79,160 @@ def fetch_json(url):
     return response.json()
 
 
-# 1️⃣ Google News
-def get_google_news():
-    try:
-        response = requests.get(RSS_URL, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-        response.raise_for_status()
-        feed = feedparser.parse(response.content)
-    except requests.RequestException as exc:
-        print(f"Google News fetch failed: {exc}")
-        return []
+def is_on_topic(text):
+    return bool(TOPIC_PATTERN.search(text or ""))
 
+
+def parse_entry_time(entry):
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed:
+        return datetime.now(timezone.utc)
+    return datetime(*parsed[:6], tzinfo=timezone.utc)
+
+
+def age_hours(dt):
+    return max((datetime.now(timezone.utc) - dt).total_seconds() / 3600.0, 0.0)
+
+
+def recency_multiplier(hours):
+    return 1.0 / (1.0 + hours / 24.0)
+
+
+def editorial_score(weight, hours, comments=0):
+    return weight * 12.0 * recency_multiplier(hours) + min(comments, 80) * 0.25
+
+
+def hn_hot_score(points, comments, hours):
+    heat = (max(points, 1) + 0.4 * comments) / math.pow(hours + 2.0, 1.8)
+    return heat * 20.0
+
+
+def make_article(title, link, source, score, summary=""):
+    return {
+        "title": title.strip(),
+        "link": link,
+        "source": source,
+        "summary": summary,
+        "score": round(score, 2),
+    }
+
+
+def get_editorial_news():
     articles = []
-    for entry in feed.entries[:30]:
-        articles.append({
-            "title": entry.get("title", "").strip(),
-            "link": entry.get("link", ""),
-            "summary": entry.get("summary", ""),
-            "score": 0,
-        })
-    return [a for a in articles if a["title"]]
-
-
-# 2️⃣ Hacker News
-def get_hackernews():
-    try:
-        ids = fetch_json("https://hacker-news.firebaseio.com/v0/topstories.json")
-    except requests.RequestException as exc:
-        print(f"Hacker News list fetch failed: {exc}")
-        return []
-
-    articles = []
-    for story_id in ids[:30]:
+    for source in RSS_SOURCES:
         try:
-            item = fetch_json(f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json")
+            response = requests.get(source["url"], headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
         except requests.RequestException as exc:
-            print(f"Hacker News item {story_id} failed: {exc}")
+            print(f"{source['name']} fetch failed: {exc}")
             continue
 
-        if not item or "title" not in item:
-            continue
-
-        articles.append({
-            "title": item["title"],
-            "link": item.get("url") or f"https://news.ycombinator.com/item?id={story_id}",
-            "summary": "",
-            "score": item.get("score", 0) + item.get("descendants", 0),
-        })
-
+        count = 0
+        for entry in feed.entries[:20]:
+            title = (entry.get("title") or "").strip()
+            link = entry.get("link") or ""
+            if not title:
+                continue
+            blob = f"{title} {entry.get('summary', '')}"
+            if source["require_topic"] and not is_on_topic(blob):
+                continue
+            try:
+                comments = int(entry.get("slash_comments") or 0)
+            except (TypeError, ValueError):
+                comments = 0
+            hours = age_hours(parse_entry_time(entry))
+            articles.append(
+                make_article(
+                    title,
+                    link,
+                    source["name"],
+                    editorial_score(source["weight"], hours, comments),
+                    entry.get("summary", ""),
+                )
+            )
+            count += 1
+        print(f"{source['name']}: {count} on-topic items")
     return articles
 
 
-# 3️⃣ 통합 + 간단 랭킹
-def merge_and_rank(g_news, hn_news):
-    combined = g_news + hn_news
+def get_hackernews():
+    since = int(time.time()) - HN_WINDOW_HOURS * 3600
+    hits = {}
 
+    def add_hit(hit):
+        object_id = str(hit.get("objectID") or "")
+        title = (hit.get("title") or "").strip()
+        if not object_id or not title or not is_on_topic(title):
+            return
+        hits[object_id] = hit
+
+    try:
+        front = fetch_json("https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=50")
+        for hit in front.get("hits", []):
+            add_hit(hit)
+    except requests.RequestException as exc:
+        print(f"Hacker News front page fetch failed: {exc}")
+
+    for query in HN_QUERIES:
+        url = (
+            "https://hn.algolia.com/api/v1/search"
+            f"?query={quote(query)}&tags=story&hitsPerPage=20"
+            f"&numericFilters=created_at_i>{since}"
+        )
+        try:
+            payload = fetch_json(url)
+        except requests.RequestException as exc:
+            print(f"Hacker News search '{query}' failed: {exc}")
+            continue
+        for hit in payload.get("hits", []):
+            add_hit(hit)
+
+    articles = []
+    for object_id, hit in hits.items():
+        points = int(hit.get("points") or 0)
+        comments = int(hit.get("num_comments") or 0)
+        created = int(hit.get("created_at_i") or time.time())
+        hours = age_hours(datetime.fromtimestamp(created, tz=timezone.utc))
+        link = hit.get("url") or f"https://news.ycombinator.com/item?id={object_id}"
+        articles.append(
+            make_article(
+                hit["title"],
+                link,
+                "Hacker News",
+                hn_hot_score(points, comments, hours),
+            )
+        )
+
+    print(f"Hacker News: {len(articles)} on-topic items")
+    return articles
+
+
+def merge_and_rank(editorial, hn_news):
+    combined = editorial + hn_news
     seen = set()
     unique = []
-    for a in combined:
-        if a["title"] not in seen:
-            seen.add(a["title"])
-            unique.append(a)
+    for article in combined:
+        key = article["title"].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(article)
+    unique.sort(key=lambda item: item["score"], reverse=True)
+    return unique[:CANDIDATE_LIMIT]
 
-    unique.sort(key=lambda x: x["score"], reverse=True)
-    return unique[:30]
 
-
-# 4️⃣ GPT 최종 선정
 def select_top_articles(articles):
     if len(articles) <= 5:
         return articles
 
     content = ""
-    for i, a in enumerate(articles, start=1):
-        content += f"{i}. {a['title']}\n"
+    for i, article in enumerate(articles, start=1):
+        content += (
+            f"{i}. [{article['source']} | heat {article['score']}] {article['title']}\n"
+        )
 
-    response = client.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "당신은 글로벌 테크 산업 분석가입니다."},
@@ -106,6 +243,8 @@ def select_top_articles(articles):
 - 기술 혁신성
 - 산업 영향력
 - 장기적 중요성
+- 최근 화제성 (heat가 높을수록 더 뜨거움)
+- 출처 신뢰도 (IEEE, Nature, MIT TR, Ars가 HN보다 공신력 있음)
 
 출력은 번호 5개만. 예: [1, 4, 7, 12, 20]
 
@@ -139,16 +278,16 @@ def select_top_articles(articles):
     return selected[:5]
 
 
-# 5️⃣ 요약
 def summarize(articles):
     content = ""
-    for a in articles:
+    for article in articles:
         content += f"""
-제목: {a['title']}
-링크: {a['link']}
+제목: {article['title']}
+출처: {article['source']}
+링크: {article['link']}
 """
 
-    response = client.chat.completions.create(
+    response = openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "당신은 MIT 수준의 테크 분석가입니다."},
@@ -174,7 +313,6 @@ def summarize(articles):
     return response.choices[0].message.content
 
 
-# 6️⃣ 이메일 전송
 def send_email(content):
     sender = os.environ["EMAIL_ADDRESS"]
     password = os.environ["EMAIL_PASSWORD"]
@@ -193,18 +331,22 @@ def send_email(content):
 
 
 if __name__ == "__main__":
-    g_news = get_google_news()
+    editorial = get_editorial_news()
     hn_news = get_hackernews()
-    print(f"Fetched Google News={len(g_news)}, Hacker News={len(hn_news)}")
+    print(f"Fetched editorial={len(editorial)}, Hacker News={len(hn_news)}")
 
-    merged = merge_and_rank(g_news, hn_news)
+    merged = merge_and_rank(editorial, hn_news)
     if not merged:
         raise RuntimeError("뉴스를 하나도 가져오지 못했습니다.")
+
+    print("Ranked candidates:")
+    for article in merged[:10]:
+        print(f"- {article['score']:6.1f} [{article['source']}] {article['title']}")
 
     top = select_top_articles(merged)
     print("Selected:")
     for article in top:
-        print(f"- {article['title']}")
+        print(f"- [{article['source']}] {article['title']}")
 
     summary = summarize(top)
     send_email(summary)
