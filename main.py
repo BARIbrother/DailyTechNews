@@ -1,46 +1,72 @@
-import feedparser
-import requests
-from openai import OpenAI
 import os
+import re
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import feedparser
+import requests
+from openai import OpenAI
+
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 RSS_URL = "https://news.google.com/rss/search?q=AI+OR+quantum+computing+OR+semiconductor&hl=en-US&gl=US&ceid=US:en"
+HTTP_HEADERS = {"User-Agent": "DailyTechNews/1.0 (GitHub Actions)"}
+HTTP_TIMEOUT = 20
+
+
+def fetch_json(url):
+    response = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
 
 # 1️⃣ Google News
 def get_google_news():
-    feed = feedparser.parse(RSS_URL)
-    articles = []
+    try:
+        response = requests.get(RSS_URL, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+    except requests.RequestException as exc:
+        print(f"Google News fetch failed: {exc}")
+        return []
 
+    articles = []
     for entry in feed.entries[:30]:
         articles.append({
-            "title": entry.title,
-            "link": entry.link,
-            "summary": entry.summary,
-            "score": 0  # 초기 점수
+            "title": entry.get("title", "").strip(),
+            "link": entry.get("link", ""),
+            "summary": entry.get("summary", ""),
+            "score": 0,
         })
-
-    return articles
+    return [a for a in articles if a["title"]]
 
 
 # 2️⃣ Hacker News
 def get_hackernews():
-    ids = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json").json()
+    try:
+        ids = fetch_json("https://hacker-news.firebaseio.com/v0/topstories.json")
+    except requests.RequestException as exc:
+        print(f"Hacker News list fetch failed: {exc}")
+        return []
+
     articles = []
+    for story_id in ids[:30]:
+        try:
+            item = fetch_json(f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json")
+        except requests.RequestException as exc:
+            print(f"Hacker News item {story_id} failed: {exc}")
+            continue
 
-    for i in ids[:30]:
-        item = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{i}.json").json()
+        if not item or "title" not in item:
+            continue
 
-        if item and "title" in item:
-            articles.append({
-                "title": item["title"],
-                "link": item.get("url", ""),
-                "summary": "",
-                "score": item.get("score", 0) + item.get("descendants", 0)
-            })
+        articles.append({
+            "title": item["title"],
+            "link": item.get("url") or f"https://news.ycombinator.com/item?id={story_id}",
+            "summary": "",
+            "score": item.get("score", 0) + item.get("descendants", 0),
+        })
 
     return articles
 
@@ -49,7 +75,6 @@ def get_hackernews():
 def merge_and_rank(g_news, hn_news):
     combined = g_news + hn_news
 
-    # 제목 기준 중복 제거
     seen = set()
     unique = []
     for a in combined:
@@ -57,16 +82,17 @@ def merge_and_rank(g_news, hn_news):
             seen.add(a["title"])
             unique.append(a)
 
-    # score 기준 정렬 (HN가 우선)
     unique.sort(key=lambda x: x["score"], reverse=True)
-
-    return unique[:30]  # 상위 30개만
+    return unique[:30]
 
 
 # 4️⃣ GPT 최종 선정
 def select_top_articles(articles):
+    if len(articles) <= 5:
+        return articles
+
     content = ""
-    for i, a in enumerate(articles):
+    for i, a in enumerate(articles, start=1):
         content += f"{i}. {a['title']}\n"
 
     response = client.chat.completions.create(
@@ -81,20 +107,36 @@ def select_top_articles(articles):
 - 산업 영향력
 - 장기적 중요성
 
-출력:
-[번호, 번호, 번호, 번호, 번호]
+출력은 번호 5개만. 예: [1, 4, 7, 12, 20]
 
 뉴스:
 {content}
 """}
         ],
-        temperature=0.3
+        temperature=0.3,
     )
 
-    import re
-    indices = list(map(int, re.findall(r'\d+', response.choices[0].message.content)))
+    raw = response.choices[0].message.content or ""
+    print(f"GPT selection: {raw}")
 
-    return [articles[i] for i in indices if i < len(articles)][:5]
+    selected = []
+    seen = set()
+    for index in map(int, re.findall(r"\d+", raw)):
+        if 1 <= index <= len(articles) and index not in seen:
+            seen.add(index)
+            selected.append(articles[index - 1])
+        if len(selected) == 5:
+            break
+
+    if len(selected) < 5:
+        print("GPT selection incomplete; filling with ranked articles")
+        for article in articles:
+            if article not in selected:
+                selected.append(article)
+            if len(selected) == 5:
+                break
+
+    return selected[:5]
 
 
 # 5️⃣ 요약
@@ -126,7 +168,7 @@ def summarize(articles):
 {content}
 """}
         ],
-        temperature=0.7
+        temperature=0.7,
     )
 
     return response.choices[0].message.content
@@ -150,13 +192,20 @@ def send_email(content):
         server.send_message(msg)
 
 
-# 실행
 if __name__ == "__main__":
     g_news = get_google_news()
     hn_news = get_hackernews()
+    print(f"Fetched Google News={len(g_news)}, Hacker News={len(hn_news)}")
 
     merged = merge_and_rank(g_news, hn_news)
+    if not merged:
+        raise RuntimeError("뉴스를 하나도 가져오지 못했습니다.")
+
     top = select_top_articles(merged)
+    print("Selected:")
+    for article in top:
+        print(f"- {article['title']}")
 
     summary = summarize(top)
     send_email(summary)
+    print("Email sent.")
